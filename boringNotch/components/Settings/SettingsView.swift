@@ -1027,6 +1027,7 @@ struct Shelf: View {
 struct WorkflowSettings: View {
     @Default(.showWorkflowTab) private var showWorkflowTab: Bool
     @Default(.workflowShowEnded) private var workflowShowEnded: Bool
+    @Default(.workflowClosedIndicator) private var workflowClosedIndicator: Bool
     @ObservedObject private var store = WorkflowStore.shared
 
     var body: some View {
@@ -1045,6 +1046,10 @@ struct WorkflowSettings: View {
                 Defaults.Toggle(key: .workflowShowEnded) {
                     Text("Beendete Sitzungen anzeigen")
                 }
+                Defaults.Toggle(key: .workflowClosedIndicator) {
+                    Text("Punkt in geschlossener Notch")
+                }
+                .disabled(!showWorkflowTab)
             } header: {
                 Text("Workflow")
             } footer: {

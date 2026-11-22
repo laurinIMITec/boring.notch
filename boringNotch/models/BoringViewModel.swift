@@ -7,6 +7,7 @@
 
 import Combine
 import Defaults
+import Foundation
 import SwiftUI
 
 class BoringViewModel: NSObject, ObservableObject {
@@ -192,7 +193,12 @@ class BoringViewModel: NSObject, ObservableObject {
     func open() {
         self.notchSize = openNotchSize
         self.notchState = .open
-        
+
+        // Offene Workflow-Anfragen haben Vorrang vor dem zuletzt gezeigten Tab.
+        if workflowNeedsAttention {
+            coordinator.currentView = .workflow
+        }
+
         // Force music information update when notch is opened
         MusicManager.shared.forceUpdate()
     }
@@ -211,10 +217,21 @@ class BoringViewModel: NSObject, ObservableObject {
 
         // Set the current view to shelf if it contains files and the user enables openShelfByDefault
         // Otherwise, if the user has not enabled openLastShelfByDefault, set the view to home
-    if !ShelfStateViewModel.shared.isEmpty && Defaults[.openShelfByDefault] {
+        // Offene Workflow-Anfragen haben Vorrang vor Shelf/Home.
+        if workflowNeedsAttention {
+            coordinator.currentView = .workflow
+        } else if !ShelfStateViewModel.shared.isEmpty && Defaults[.openShelfByDefault] {
             coordinator.currentView = .shelf
         } else if !coordinator.openLastTabByDefault {
             coordinator.currentView = .home
+        }
+    }
+
+    /// True, wenn der Workflow-Tab aktiviert ist und eine Frage/Freigabe wartet.
+    private var workflowNeedsAttention: Bool {
+        guard Defaults[.showWorkflowTab], Thread.isMainThread else { return false }
+        return MainActor.assumeIsolated {
+            WorkflowStore.shared.needsYouCount > 0
         }
     }
 

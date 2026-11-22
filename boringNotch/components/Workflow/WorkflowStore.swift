@@ -2,7 +2,7 @@
 //  WorkflowStore.swift
 //  boringNotch
 //
-//  Beobachtbarer Store fuer den Workflow-Tab: Long-Poll, Drosselung und Aktionen.
+//  Beobachtbarer Store fuer den Workflow-Tab: Long-Poll und Aktionen.
 //
 
 import Combine
@@ -30,7 +30,6 @@ final class WorkflowStore: ObservableObject {
     private var backoffAttempt = 0
 
     private static let backoffSeconds: [UInt64] = [2, 5, 10, 30]
-    private static let throttledInterval: UInt64 = 5_000_000_000
     private static let longPollWait = 8000
 
     init(client: WorkflowClient = WorkflowClient()) {
@@ -56,17 +55,11 @@ final class WorkflowStore: ObservableObject {
         lastRev = nil
     }
 
-    /// Aktiver Tab/offene Notch: Long-Poll. Sonst normaler GET alle 5 s (Badge).
+    /// Aktiver Tab/offene Notch. Das Polling laeuft immer als Long-Poll;
+    /// der Parameter bleibt fuer die bestehende API erhalten.
     func setActive(_ active: Bool) {
         guard isActive != active else { return }
         isActive = active
-
-        guard pollTask != nil else { return }
-        pollTask?.cancel()
-        pollTask = Task { [weak self] in
-            guard let self = self else { return }
-            await self.runLoop()
-        }
     }
 
     // MARK: - Derived state
@@ -201,20 +194,13 @@ final class WorkflowStore: ObservableObject {
 
         while !Task.isCancelled {
             do {
-                let newState: WorkflowState
-                if isActive {
-                    newState = try await client.fetchState(since: lastRev, wait: Self.longPollWait)
-                } else {
-                    newState = try await client.fetchState()
-                }
+                // Immer Long-Poll: der Server antwortet sofort bei Aenderungen und
+                // haelt die Verbindung sonst bis zum Timeout offen.
+                let newState = try await client.fetchState(since: lastRev, wait: Self.longPollWait)
 
                 guard !Task.isCancelled else { break }
                 apply(newState)
                 backoffAttempt = 0
-
-                if !isActive {
-                    try? await Task.sleep(nanoseconds: Self.throttledInterval)
-                }
             } catch is CancellationError {
                 break
             } catch {

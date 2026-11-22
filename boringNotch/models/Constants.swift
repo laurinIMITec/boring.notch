@@ -174,6 +174,7 @@ extension Defaults.Keys {
     // MARK: Workflow
     static let showWorkflowTab = Key<Bool>("showWorkflowTab", default: true)
     static let workflowShowEnded = Key<Bool>("workflowShowEnded", default: false)
+    static let workflowClosedIndicator = Key<Bool>("workflowClosedIndicator", default: true)
 
     // MARK: Calendar
     static let calendarSelectionState = Key<CalendarSelectionState>("calendarSelectionState", default: .all)

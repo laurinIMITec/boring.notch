@@ -112,6 +112,13 @@ struct ContentView: View {
                         color: ((vm.notchState == .open || isHovering) && Defaults[.enableShadow])
                             ? .black.opacity(0.7) : .clear, radius: Defaults[.cornerRadiusScaling] ? 6 : 4
                     )
+                    .overlay(alignment: .trailing) {
+                        if vm.notchState == .closed {
+                            WorkflowAttentionDot()
+                                .offset(x: 12)
+                                .allowsHitTesting(false)
+                        }
+                    }
                     .padding(
                         .bottom,
                         vm.effectiveClosedNotchHeight == 0 ? 10 : 0

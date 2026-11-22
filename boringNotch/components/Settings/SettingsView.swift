@@ -51,6 +51,9 @@ struct SettingsView: View {
                 NavigationLink(value: "Shelf") {
                     Label("Shelf", systemImage: "books.vertical")
                 }
+                NavigationLink(value: "Workflow") {
+                    Label("Workflow", systemImage: "bolt.horizontal.circle")
+                }
                 NavigationLink(value: "Shortcuts") {
                     Label("Shortcuts", systemImage: "keyboard")
                 }
@@ -85,6 +88,8 @@ struct SettingsView: View {
                     Charge()
                 case "Shelf":
                     Shelf()
+                case "Workflow":
+                    WorkflowSettings()
                 case "Shortcuts":
                     Shortcuts()
                 case "Extensions":
@@ -1015,6 +1020,81 @@ struct Shelf: View {
         }
         .accentColor(.effectiveAccent)
         .navigationTitle("Shelf")
+    }
+}
+
+@MainActor
+struct WorkflowSettings: View {
+    @Default(.showWorkflowTab) private var showWorkflowTab: Bool
+    @Default(.workflowShowEnded) private var workflowShowEnded: Bool
+    @ObservedObject private var store = WorkflowStore.shared
+
+    var body: some View {
+        Form {
+            Section {
+                Defaults.Toggle(key: .showWorkflowTab) {
+                    Text("Workflow-Tab anzeigen")
+                }
+                .onChange(of: showWorkflowTab) { _, isEnabled in
+                    if isEnabled {
+                        WorkflowStore.shared.start()
+                    } else {
+                        WorkflowStore.shared.stop()
+                    }
+                }
+                Defaults.Toggle(key: .workflowShowEnded) {
+                    Text("Beendete Sitzungen anzeigen")
+                }
+            } header: {
+                Text("Workflow")
+            } footer: {
+                Text("Der Workflow-Tab zeigt laufende Sitzungen der lokalen Workflow-App und erlaubt es, offene Anfragen direkt aus der Notch zu beantworten.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Section {
+                HStack {
+                    Text("Verbindung")
+                    Spacer()
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(connectionColor)
+                            .frame(width: 8, height: 8)
+                        Text(connectionText)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } header: {
+                Text("Status")
+            }
+        }
+        .accentColor(.effectiveAccent)
+        .navigationTitle("Workflow")
+    }
+
+    private var connectionText: String {
+        switch store.connection {
+        case .notRunning:
+            return "Workflow-App läuft nicht"
+        case .connecting:
+            return "Verbinde …"
+        case .connected:
+            return "Verbunden"
+        case .error(let message):
+            return message
+        }
+    }
+
+    private var connectionColor: Color {
+        switch store.connection {
+        case .connected:
+            return .green
+        case .connecting:
+            return .orange
+        case .notRunning, .error:
+            return .red
+        }
     }
 }
 

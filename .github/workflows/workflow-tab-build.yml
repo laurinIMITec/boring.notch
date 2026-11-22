@@ -1,11 +1,13 @@
 name: "Workflow Tab Build (ad-hoc)"
 
-# Fork-friendly build that needs no Apple developer certificate and no repository
-# secret. The app is signed ad-hoc ("-"), so it is NOT notarized. After download
-# open it via right-click > Open (or run `xattr -dr com.apple.quarantine <app>`).
+# Fork-friendly build that needs no Apple developer certificate. The app is
+# signed ad-hoc ("-"), so it is NOT notarized. After download open it via
+# right-click > Open (or run `xattr -dr com.apple.quarantine <app>`). Tag builds
+# additionally publish a Sparkle appcast when the optional SPARKLE_PRIVATE_KEY
+# repository secret is configured; without it the release still happens.
 #
 # Triggers:
-#   * push tag "workflow-tab-v*"  -> build + GitHub release (DMG + ZIP)
+#   * push tag "workflow-tab-v*"  -> build + GitHub release (DMG + ZIP + appcast)
 #   * push to "claude/**"         -> build + artifact upload only
 #   * workflow_dispatch           -> build + artifact upload only
 #
@@ -37,6 +39,9 @@ env:
   # the fallback signing step resolves them into a temporary copy first.
   APP_ENTITLEMENTS: boringNotch/boringNotch.entitlements
   XPC_ENTITLEMENTS: BoringNotchXPCHelper/BoringNotchXPCHelper.entitlements
+  # The fork the Sparkle feed (SUFeedURL in Info.plist) points at. Release URLs
+  # in the generated appcast are derived from this value.
+  RELEASE_REPO: laurinIMITec/boring.notch
 
 jobs:
   build:
@@ -74,9 +79,11 @@ jobs:
         run: |
           set -euo pipefail
           VERSION=""
+          TAG_VERSION=""
           # Tag builds: "workflow-tab-v1.2.3" -> "1.2.3".
           if [[ "${GITHUB_REF}" == refs/tags/workflow-tab-v* ]]; then
-            VERSION="${GITHUB_REF_NAME#workflow-tab-v}"
+            TAG_VERSION="${GITHUB_REF_NAME#workflow-tab-v}"
+            VERSION="$TAG_VERSION"
           fi
           # Branch/dispatch builds (and degenerate tags) fall back to the short SHA.
           if [[ -z "$VERSION" ]]; then
@@ -91,10 +98,26 @@ jobs:
             echo "::error::Could not derive a non-empty version"
             exit 1
           fi
+
+          # CFBundleShortVersionString: the tag version for releases, otherwise
+          # 0.0.0-<shortsha> so test builds are clearly prereleases.
+          if [[ -n "$TAG_VERSION" ]]; then
+            MARKETING_VERSION="$VERSION"
+          else
+            MARKETING_VERSION="0.0.0-${GITHUB_SHA:0:7}"
+          fi
+          MARKETING_VERSION="$(printf '%s' "$MARKETING_VERSION" | tr -c 'A-Za-z0-9._-' '-')"
+
+          # CFBundleVersion must increase monotonically for Sparkle and stays far
+          # above the upstream counter (271). GITHUB_RUN_NUMBER is monotonic.
+          BUILD_NUMBER="$(( 10000 + ${GITHUB_RUN_NUMBER:-0} ))"
+
           ARTIFACT_NAME="BoringNotch-Workflow-${VERSION}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "marketing_version=${MARKETING_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "build_number=${BUILD_NUMBER}" >> "$GITHUB_OUTPUT"
           echo "artifact_name=${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
-          echo "Building version: ${VERSION}"
+          echo "Building version: ${VERSION} (MARKETING_VERSION=${MARKETING_VERSION}, CURRENT_PROJECT_VERSION=${BUILD_NUMBER})"
 
       - name: Resolve Swift packages
         shell: bash
@@ -114,6 +137,9 @@ jobs:
         # fallen sonst durch die Library Validation (App startet nicht).
         # -skipMacroValidation keeps Swift macro packages from
         # blocking non-interactive CI builds.
+        env:
+          MARKETING_VERSION: ${{ steps.version.outputs.marketing_version }}
+          BUILD_NUMBER: ${{ steps.version.outputs.build_number }}
         run: |
           set -euo pipefail
           xcodebuild build \
@@ -123,6 +149,8 @@ jobs:
             -derivedDataPath build \
             -destination "platform=macOS" \
             -skipMacroValidation \
+            MARKETING_VERSION="${MARKETING_VERSION}" \
+            CURRENT_PROJECT_VERSION="${BUILD_NUMBER}" \
             CODE_SIGN_IDENTITY=- \
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM= \
@@ -255,6 +283,131 @@ jobs:
 
           ls -lh "$DIST_DIR"
 
+      - name: Sign ZIP and generate Sparkle appcast
+        id: sparkle
+        # Tag-only: the appcast points at assets of this GitHub release. Without
+        # the optional secret the release still happens, just without a feed.
+        if: startsWith(github.ref, 'refs/tags/workflow-tab-v')
+        shell: bash
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          DIST_DIR: ${{ runner.temp }}/dist
+          ZIP_NAME: BoringNotch-Workflow-${{ steps.version.outputs.version }}-mac.zip
+          MARKETING_VERSION: ${{ steps.version.outputs.marketing_version }}
+          BUILD_NUMBER: ${{ steps.version.outputs.build_number }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ZIP_PATH="${DIST_DIR}/${ZIP_NAME}"
+          if [[ ! -f "$ZIP_PATH" ]]; then
+            echo "::error::Expected ZIP archive at ${ZIP_PATH}"
+            exit 1
+          fi
+
+          # Missing secret: warn and keep going (DMG/ZIP release without appcast).
+          if [[ -z "${SPARKLE_PRIVATE_KEY:-}" ]]; then
+            echo "generated=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::SPARKLE_PRIVATE_KEY is not configured; skipping ZIP signature and appcast.xml (release continues without a Sparkle feed)"
+            exit 0
+          fi
+
+          # sign_update ships with the resolved Sparkle package artifacts; look
+          # it up instead of relying on the exact DerivedData layout.
+          SIGN_UPDATE="$(find build/SourcePackages -type f -name sign_update -print -quit 2>/dev/null || true)"
+          if [[ -z "$SIGN_UPDATE" ]]; then
+            echo "::error::Sparkle sign_update tool was not found under build/SourcePackages"
+            find build -maxdepth 10 -name 'sign_update*' -print 2>/dev/null || true
+            exit 1
+          fi
+          [[ -x "$SIGN_UPDATE" ]] || chmod +x "$SIGN_UPDATE"
+          echo "Using sign_update: ${SIGN_UPDATE}"
+
+          # The private key only ever lives in a $RUNNER_TEMP file with mode 0600
+          # that is removed in this same step, including on failure.
+          umask 077
+          KEY_FILE="$(mktemp "${RUNNER_TEMP}/sparkle-private-key.XXXXXX")"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          # Already base64 (generate_keys -x format). Never echo it, never xtrace.
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$KEY_FILE"
+
+          SIGN_OUTPUT="$("$SIGN_UPDATE" --ed-key-file "$KEY_FILE" "$ZIP_PATH")"
+          # Delete immediately; the EXIT trap below covers any earlier failure.
+          rm -f "$KEY_FILE"
+
+          ED_SIGNATURE="$(printf '%s\n' "$SIGN_OUTPUT" | sed -n 's/.*edSignature="\([^"]*\)".*/\1/p' | head -n 1)"
+          SIGNED_LENGTH="$(printf '%s\n' "$SIGN_OUTPUT" | sed -n 's/.*length="\([0-9][0-9]*\)".*/\1/p' | head -n 1)"
+          ZIP_LENGTH="$(stat -f%z "$ZIP_PATH")"
+          if [[ -z "$ED_SIGNATURE" ]]; then
+            echo "::error::sign_update did not return an EdDSA signature"
+            exit 1
+          fi
+          if [[ -n "$SIGNED_LENGTH" && "$SIGNED_LENGTH" != "$ZIP_LENGTH" ]]; then
+            echo "::error::sign_update reported length ${SIGNED_LENGTH}, but ${ZIP_NAME} has ${ZIP_LENGTH} bytes"
+            exit 1
+          fi
+          LENGTH="${SIGNED_LENGTH:-$ZIP_LENGTH}"
+
+          export ED_SIGNATURE LENGTH ZIP_NAME MARKETING_VERSION BUILD_NUMBER RELEASE_TAG
+          export APPCAST_PATH="${DIST_DIR}/appcast.xml"
+          python3 - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from email.utils import formatdate
+          from urllib.parse import quote
+
+          ns = "http://www.andymatuschak.org/xml-namespaces/sparkle"
+          repo = os.environ["RELEASE_REPO"]
+          tag = quote(os.environ["RELEASE_TAG"], safe="")
+          zip_name = os.environ["ZIP_NAME"]
+          short_version = os.environ["MARKETING_VERSION"]
+          build_version = os.environ["BUILD_NUMBER"]
+          signature = os.environ["ED_SIGNATURE"]
+          length = os.environ["LENGTH"]
+
+          release_url = f"https://github.com/{repo}/releases/tag/{tag}"
+          enclosure_url = (
+              f"https://github.com/{repo}/releases/download/{tag}/"
+              f"{quote(zip_name, safe='')}"
+          )
+
+          # RFC 2822 wants a numeric zone; formatdate(usegmt=True) emits "GMT".
+          pub_date = formatdate(usegmt=True)
+          if pub_date.endswith(" GMT"):
+              pub_date = pub_date[:-4] + " +0000"
+
+          rss = ET.Element("rss", {"version": "2.0", "xmlns:sparkle": ns})
+          channel = ET.SubElement(rss, "channel")
+          item = ET.SubElement(channel, "item")
+          ET.SubElement(item, "title").text = f"Boring Notch {short_version}"
+          ET.SubElement(item, "pubDate").text = pub_date
+          ET.SubElement(item, "description").text = f'<a href="{release_url}">Release notes</a>'
+          ET.SubElement(item, "sparkle:version").text = build_version
+          ET.SubElement(item, "sparkle:shortVersionString").text = short_version
+          ET.SubElement(item, "sparkle:minimumSystemVersion").text = "14.0"
+          ET.SubElement(item, "enclosure", {
+              "url": enclosure_url,
+              "length": length,
+              "type": "application/octet-stream",
+              "sparkle:edSignature": signature,
+          })
+
+          path = os.environ["APPCAST_PATH"]
+          ET.ElementTree(rss).write(path, encoding="utf-8", xml_declaration=True)
+
+          # Round-trip: a malformed or namespace-less feed must never ship.
+          root = ET.parse(path).getroot()
+          enclosure = root.find("./channel/item/enclosure")
+          if enclosure is None:
+              raise SystemExit("appcast.xml has no enclosure element")
+          if enclosure.get(f"{{{ns}}}edSignature") != signature:
+              raise SystemExit("appcast.xml signature does not round-trip")
+          if enclosure.get("length") != length:
+              raise SystemExit("appcast.xml length does not round-trip")
+          print(f"Wrote appcast: {path}")
+          print(f"  version={build_version} shortVersionString={short_version} length={length}")
+          PY
+          echo "generated=true" >> "$GITHUB_OUTPUT"
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -263,6 +416,16 @@ jobs:
             ${{ runner.temp }}/dist/*.dmg
             ${{ runner.temp }}/dist/*.zip
             ${{ runner.temp }}/dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Sparkle appcast
+        # Only present when the tag build had a signing key.
+        if: steps.sparkle.outputs.generated == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.version.outputs.artifact_name }}-appcast
+          path: ${{ runner.temp }}/dist/appcast.xml
           if-no-files-found: error
           retention-days: 14
 
@@ -283,12 +446,42 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: List release assets
+      - name: Collect release assets
+        id: assets
         shell: bash
-        run: ls -lh dist
+        run: |
+          set -euo pipefail
+          FILES=""
+          for pattern in "dist/*.dmg" "dist/*.zip" "dist/SHA256SUMS.txt"; do
+            matched=false
+            for file in $pattern; do
+              if [[ -f "$file" ]]; then
+                matched=true
+                FILES+="${file}"$'\n'
+              fi
+            done
+            if [[ "$matched" != "true" ]]; then
+              echo "::error::Missing release asset matching ${pattern}"
+              exit 1
+            fi
+          done
+          # appcast.xml is absent when the optional signing secret is not set;
+          # that is a warning, not a failed release.
+          if [[ -f dist/appcast.xml ]]; then
+            FILES+="dist/appcast.xml"$'\n'
+          else
+            echo "::warning::appcast.xml is missing (SPARKLE_PRIVATE_KEY not configured); publishing without a Sparkle feed"
+          fi
+          {
+            echo "files<<ASSET_LIST"
+            printf '%s' "$FILES"
+            echo "ASSET_LIST"
+          } >> "$GITHUB_OUTPUT"
+          ls -lh dist
 
       - name: Create or update GitHub release
-        # Uses the workflow-scoped GITHUB_TOKEN implicitly (no repository secret).
+        # Uses the workflow-scoped GITHUB_TOKEN; the Sparkle key is only read in
+        # the build job.
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
@@ -302,8 +495,5 @@ jobs:
                 xattr -dr com.apple.quarantine "/Applications/Boring Notch.app"
 
             Requirement: macOS 14 or newer.
-          files: |
-            dist/*.dmg
-            dist/*.zip
-            dist/SHA256SUMS.txt
+          files: ${{ steps.assets.outputs.files }}
           fail_on_unmatched_files: true

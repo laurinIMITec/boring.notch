@@ -110,7 +110,9 @@ jobs:
         # No Apple certificate: identity "-" plus an empty development team makes
         # xcodebuild sign ad-hoc. CODE_SIGNING_ALLOWED stays YES so the app and its
         # embedded XPC service keep their entitlements (sandbox, camera, calendars,
-        # Apple events, ...). -skipMacroValidation keeps Swift macro packages from
+        # Apple events, ...). Hardened Runtime aus: ad-hoc signierte Frameworks
+        # fallen sonst durch die Library Validation (App startet nicht).
+        # -skipMacroValidation keeps Swift macro packages from
         # blocking non-interactive CI builds.
         run: |
           set -euo pipefail
@@ -125,7 +127,8 @@ jobs:
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM= \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=YES
+            CODE_SIGNING_ALLOWED=YES \
+            ENABLE_HARDENED_RUNTIME=NO
 
       - name: Locate built app
         id: locate

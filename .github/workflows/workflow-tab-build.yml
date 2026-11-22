@@ -1,0 +1,306 @@
+name: "Workflow Tab Build (ad-hoc)"
+
+# Fork-friendly build that needs no Apple developer certificate and no repository
+# secret. The app is signed ad-hoc ("-"), so it is NOT notarized. After download
+# open it via right-click > Open (or run `xattr -dr com.apple.quarantine <app>`).
+#
+# Triggers:
+#   * push tag "workflow-tab-v*"  -> build + GitHub release (DMG + ZIP)
+#   * push to "claude/**"         -> build + artifact upload only
+#   * workflow_dispatch           -> build + artifact upload only
+#
+# Built on a GitHub-hosted macOS runner with the latest stable Xcode available on
+# the image (Xcode 16+ on macos-15); no Xcode installation is downloaded.
+
+on:
+  push:
+    branches:
+      - "claude/**"
+    tags:
+      - "workflow-tab-v*"
+  workflow_dispatch:
+
+# Keep tag builds independent from branch builds; never cancel a release build.
+concurrency:
+  group: workflow-tab-build-${{ github.ref }}
+  cancel-in-progress: false
+
+# Least privilege by default; only the release job gets contents: write.
+permissions:
+  contents: read
+
+env:
+  PROJECT_NAME: boringNotch
+  SCHEME_NAME: boringNotch
+  # Entitlements stay active for the ad-hoc signature. The plist contains
+  # $(PRODUCT_BUNDLE_IDENTIFIER) placeholders that codesign does not expand, so
+  # the fallback signing step resolves them into a temporary copy first.
+  APP_ENTITLEMENTS: boringNotch/boringNotch.entitlements
+  XPC_ENTITLEMENTS: BoringNotchXPCHelper/BoringNotchXPCHelper.entitlements
+
+jobs:
+  build:
+    name: Build (ad-hoc signed)
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      artifact_name: ${{ steps.version.outputs.artifact_name }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Show toolchain versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcode-select -p
+          swift --version || true
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=""
+          # Tag builds: "workflow-tab-v1.2.3" -> "1.2.3".
+          if [[ "${GITHUB_REF}" == refs/tags/workflow-tab-v* ]]; then
+            VERSION="${GITHUB_REF_NAME#workflow-tab-v}"
+          fi
+          # Branch/dispatch builds (and degenerate tags) fall back to the short SHA.
+          if [[ -z "$VERSION" ]]; then
+            VERSION="${GITHUB_SHA:0:7}"
+            if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+              echo "::warning::Tag '${GITHUB_REF_NAME}' has no version suffix, using short SHA '${VERSION}'"
+            fi
+          fi
+          # Keep the value safe for file names and shell usage.
+          VERSION="$(printf '%s' "$VERSION" | tr -c 'A-Za-z0-9._-' '-')"
+          if [[ -z "$VERSION" || "$VERSION" == "-" ]]; then
+            echo "::error::Could not derive a non-empty version"
+            exit 1
+          fi
+          ARTIFACT_NAME="BoringNotch-Workflow-${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
+          echo "Building version: ${VERSION}"
+
+      - name: Resolve Swift packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project "${PROJECT_NAME}.xcodeproj" \
+            -scheme "${SCHEME_NAME}" \
+            -derivedDataPath build
+
+      - name: Build Release (ad-hoc signed)
+        shell: bash
+        # No Apple certificate: identity "-" plus an empty development team makes
+        # xcodebuild sign ad-hoc. CODE_SIGNING_ALLOWED stays YES so the app and its
+        # embedded XPC service keep their entitlements (sandbox, camera, calendars,
+        # Apple events, ...). -skipMacroValidation keeps Swift macro packages from
+        # blocking non-interactive CI builds.
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -project "${PROJECT_NAME}.xcodeproj" \
+            -scheme "${SCHEME_NAME}" \
+            -configuration Release \
+            -derivedDataPath build \
+            -destination "platform=macOS" \
+            -skipMacroValidation \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM= \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=YES
+
+      - name: Locate built app
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          PRODUCTS_DIR="build/Build/Products/Release"
+          APP_PATH=""
+          # The product name is either "boringNotch.app" or "Boring Notch.app".
+          for candidate in "${PRODUCTS_DIR}/boringNotch.app" "${PRODUCTS_DIR}/Boring Notch.app"; do
+            if [[ -d "$candidate" ]]; then
+              APP_PATH="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$APP_PATH" ]]; then
+            while IFS= read -r -d '' candidate; do
+              APP_PATH="$candidate"
+              break
+            done < <(find "$PRODUCTS_DIR" -maxdepth 1 -type d -name '*.app' -print0 2>/dev/null || true)
+          fi
+          if [[ -z "$APP_PATH" ]]; then
+            echo "::error::No .app bundle found in ${PRODUCTS_DIR}"
+            find build -maxdepth 6 -name '*.app' -print 2>/dev/null || true
+            exit 1
+          fi
+          # Use an absolute path so later steps are independent of the working dir.
+          APP_PATH="$(cd "$(dirname "$APP_PATH")" && pwd)/$(basename "$APP_PATH")"
+          echo "app_path=${APP_PATH}" >> "$GITHUB_OUTPUT"
+          echo "Found app bundle: ${APP_PATH}"
+
+      - name: Ensure ad-hoc signature and entitlements
+        shell: bash
+        env:
+          APP_PATH: ${{ steps.locate.outputs.app_path }}
+        run: |
+          set -euo pipefail
+          # Normally nothing to do here: xcodebuild already signed the app and the
+          # embedded XPC service ad-hoc, including the entitlements referenced via
+          # CODE_SIGN_ENTITLEMENTS (boringNotch/boringNotch.entitlements).
+          # The fallback is only used if a build ever ends up unsigned, because an
+          # unsigned sandboxed app would crash on launch. The naive
+          #   codesign --force --deep --sign - --entitlements boringNotch/boringNotch.entitlements "$APP_PATH"
+          # is deliberately split: a deep re-sign with the app's entitlements would
+          # also push them onto the embedded XPC helper and break its sandbox
+          # settings. Instead: deep ad-hoc base signature, then XPC entitlements,
+          # then the app with boringNotch/boringNotch.entitlements (no --deep).
+          # codesign does not expand Xcode build settings, so the
+          # $(PRODUCT_BUNDLE_IDENTIFIER) placeholders are resolved into temp copies.
+          resolve_entitlements() {
+            src="$1"
+            bundle_id="$2"
+            out="$3"
+            sed "s|\$(PRODUCT_BUNDLE_IDENTIFIER)|${bundle_id}|g" "$src" > "$out"
+          }
+
+          if codesign --verify --deep --strict "$APP_PATH" >/dev/null 2>&1; then
+            echo "App is already ad-hoc signed:"
+            codesign --display --verbose=2 "$APP_PATH" 2>&1 | head -n 20
+            exit 0
+          fi
+
+          echo "::warning::App signature missing or invalid, applying ad-hoc signature"
+          # 1) Give every nested code object a base ad-hoc signature.
+          codesign --force --deep --sign - "$APP_PATH"
+          # 2) Sign the embedded XPC service with its own entitlements.
+          if [[ -d "$APP_PATH/Contents/XPCServices" ]]; then
+            while IFS= read -r -d '' xpc; do
+              xpc_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$xpc/Contents/Info.plist")"
+              resolve_entitlements "$XPC_ENTITLEMENTS" "$xpc_bundle_id" "$RUNNER_TEMP/xpc.entitlements"
+              codesign --force --sign - \
+                --entitlements "$RUNNER_TEMP/xpc.entitlements" \
+                "$xpc"
+            done < <(find "$APP_PATH/Contents/XPCServices" -maxdepth 1 -type d -name '*.xpc' -print0 2>/dev/null || true)
+          fi
+          # 3) Re-sign the app itself last (inner code first) with entitlements.
+          #    Deliberately no --deep here: nested code was signed in steps 1-2 and
+          #    must not inherit the app's entitlements.
+          app_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Contents/Info.plist")"
+          resolve_entitlements "$APP_ENTITLEMENTS" "$app_bundle_id" "$RUNNER_TEMP/app.entitlements"
+          codesign --force --sign - \
+            --entitlements "$RUNNER_TEMP/app.entitlements" \
+            "$APP_PATH"
+          codesign --verify --deep --strict "$APP_PATH"
+
+      - name: Create DMG and ZIP
+        shell: bash
+        env:
+          APP_PATH: ${{ steps.locate.outputs.app_path }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          DIST_DIR="$RUNNER_TEMP/dist"
+          STAGING_DIR="$RUNNER_TEMP/dmg-staging"
+          rm -rf "$DIST_DIR" "$STAGING_DIR"
+          mkdir -p "$DIST_DIR" "$STAGING_DIR"
+
+          APP_BASENAME="$(basename "$APP_PATH")"
+          ditto "$APP_PATH" "$STAGING_DIR/$APP_BASENAME"
+          ln -s /Applications "$STAGING_DIR/Applications"
+
+          DMG_NAME="BoringNotch-Workflow-${VERSION}.dmg"
+          ZIP_NAME="BoringNotch-Workflow-${VERSION}-mac.zip"
+
+          hdiutil create \
+            -volname "Boring Notch ${VERSION}" \
+            -srcfolder "$STAGING_DIR" \
+            -ov \
+            -format UDZO \
+            "$DIST_DIR/$DMG_NAME"
+
+          # Zip the app from its own directory so the archive contains "<App>.app"
+          # at the root and not the full DerivedData path.
+          (
+            cd "$(dirname "$APP_PATH")"
+            ditto -c -k --keepParent "$APP_BASENAME" "$DIST_DIR/$ZIP_NAME"
+          )
+
+          (
+            cd "$DIST_DIR"
+            shasum -a 256 "$DMG_NAME" "$ZIP_NAME" > SHA256SUMS.txt
+            cat SHA256SUMS.txt
+          )
+
+          ls -lh "$DIST_DIR"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.version.outputs.artifact_name }}
+          path: |
+            ${{ runner.temp }}/dist/*.dmg
+            ${{ runner.temp }}/dist/*.zip
+            ${{ runner.temp }}/dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    # Only tag pushes of the form workflow-tab-v* create a release.
+    if: startsWith(github.ref, 'refs/tags/workflow-tab-v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: BoringNotch-Workflow-*
+          path: dist
+          merge-multiple: true
+
+      - name: List release assets
+        shell: bash
+        run: ls -lh dist
+
+      - name: Create or update GitHub release
+        # Uses the workflow-scoped GITHUB_TOKEN implicitly (no repository secret).
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Boring Notch Workflow Tab ${{ needs.build.outputs.version }}"
+          body: |
+            Ad-hoc signed build of the workflow tab branch.
+
+            This build is **not notarized** and uses no Apple developer certificate.
+            On first launch, open the app via right-click > Open, or run:
+
+                xattr -dr com.apple.quarantine "/Applications/Boring Notch.app"
+
+            Requirement: macOS 14 or newer.
+          files: |
+            dist/*.dmg
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true

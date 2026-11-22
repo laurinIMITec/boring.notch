@@ -5,6 +5,7 @@
 //  Liste der Workflow-Sitzungen inklusive direkter Aktionen.
 //
 
+import AppKit
 import Defaults
 import Foundation
 import SwiftUI
@@ -41,7 +42,16 @@ struct WorkflowView: View {
         .padding(.horizontal, 10)
         .padding(.bottom, 6)
         .onAppear { store.setActive(true) }
-        .onDisappear { store.setActive(false) }
+        .onDisappear {
+            store.setActive(false)
+            // Tab-Wechsel/Notch zu: Bearbeitung beenden.
+            WorkflowKeyboard.shared.endEditing()
+        }
+        .onExitCommand {
+            // Escape beendet die Bearbeitung auch dann, wenn das Textfeld
+            // den Tastatur-Fokus bereits verloren hat.
+            WorkflowKeyboard.shared.endEditing()
+        }
     }
 
     private func errorBanner(_ message: String) -> some View {
@@ -129,9 +139,16 @@ private struct WorkflowSessionRow: View {
     let session: WorkflowSession
     @ObservedObject var store: WorkflowStore
 
+    private enum InputField: Hashable {
+        case answer
+        case reply
+    }
+
     @State private var answerText = ""
     @State private var replyText = ""
     @State private var stopConfirmation = false
+    @State private var notchWindow: NSWindow?
+    @FocusState private var focusedInput: InputField?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -160,7 +177,10 @@ private struct WorkflowSessionRow: View {
                 }
             }
 
-            if let summaryText {
+            if let expandedContext {
+                // Frage/Antwort-Kontext vollstaendig lesbar (mehrzeilig, scrollbar).
+                contextCard(expandedContext)
+            } else if let summaryText {
                 Text(summaryText)
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
@@ -177,10 +197,51 @@ private struct WorkflowSessionRow: View {
             RoundedRectangle(cornerRadius: 8)
                 .fill(Color(nsColor: .secondarySystemFill).opacity(0.35))
         )
+        .background(
+            WorkflowWindowAccessor { window in
+                if notchWindow !== window {
+                    notchWindow = window
+                }
+            }
+        )
         .opacity(session.normalizedStatus == "ended" ? 0.6 : 1)
         .onChange(of: session.normalizedStatus) { _, _ in
             stopConfirmation = false
+            if focusedInput != nil {
+                cancelEditing()
+            }
         }
+        .onChange(of: focusedInput) { _, newValue in
+            if newValue != nil {
+                WorkflowKeyboard.shared.beginEditing(in: notchWindow)
+            } else {
+                WorkflowKeyboard.shared.endEditing()
+            }
+        }
+        .onDisappear {
+            if focusedInput != nil {
+                cancelEditing()
+            }
+        }
+    }
+
+    private func contextCard(_ text: String) -> some View {
+        ScrollView(.vertical, showsIndicators: true) {
+            Text(text)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+        }
+        .frame(maxHeight: 104)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color(nsColor: .textBackgroundColor).opacity(0.35))
+        )
     }
 
     // MARK: Actions
@@ -212,8 +273,10 @@ private struct WorkflowSessionRow: View {
     private var questionActions: some View {
         let options = questionOptions
         if options.isEmpty {
-            inputField(placeholder: "Antwort …", text: $answerText) {
-                await store.answer(session: session, text: answerText)
+            inputField(placeholder: "Antwort …", text: $answerText, field: .answer) {
+                let trimmed = answerText.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return }
+                await store.answer(session: session, text: trimmed)
                 answerText = ""
             }
         } else {
@@ -232,8 +295,10 @@ private struct WorkflowSessionRow: View {
 
     @ViewBuilder
     private var replyActions: some View {
-        inputField(placeholder: "Antwort an die Sitzung …", text: $replyText) {
-            await store.reply(session: session, text: replyText)
+        inputField(placeholder: "Antwort an die Sitzung …", text: $replyText, field: .reply) {
+            let trimmed = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            await store.reply(session: session, text: trimmed)
             replyText = ""
         }
     }
@@ -269,6 +334,7 @@ private struct WorkflowSessionRow: View {
     private func inputField(
         placeholder: String,
         text: Binding<String>,
+        field: InputField,
         onSubmit: @escaping () async -> Void
     ) -> some View {
         let isDisabled = text.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -277,6 +343,7 @@ private struct WorkflowSessionRow: View {
             TextField(placeholder, text: text)
                 .textFieldStyle(.plain)
                 .font(.system(size: 11))
+                .focused($focusedInput, equals: field)
                 .padding(.horizontal, 6)
                 .padding(.vertical, 3)
                 .background(
@@ -285,13 +352,43 @@ private struct WorkflowSessionRow: View {
                 )
                 .onSubmit {
                     guard !isDisabled else { return }
-                    Task { await onSubmit() }
+                    send(field: field, onSubmit: onSubmit)
                 }
+                .simultaneousGesture(
+                    TapGesture().onEnded {
+                        // Fenster key machen, bevor der Fokus gesetzt wird.
+                        WorkflowKeyboard.shared.beginEditing(in: notchWindow)
+                        focusedInput = field
+                    }
+                )
 
             actionButton("Senden", tint: .accentColor, prominent: true) {
-                await onSubmit()
+                guard !isDisabled else { return }
+                send(field: field, onSubmit: onSubmit)
             }
+            .disabled(isDisabled)
+            .opacity(isDisabled ? 0.45 : 1)
         }
+        .onExitCommand {
+            // Escape bricht ab: Text verwerfen und Fokus abgeben.
+            text.wrappedValue = ""
+            cancelEditing()
+        }
+    }
+
+    /// Sendet den Text und beendet die Bearbeitung (Fokus/Key-Status zurueck).
+    private func send(field: InputField, onSubmit: @escaping () async -> Void) {
+        if focusedInput == field {
+            focusedInput = nil
+        }
+        WorkflowKeyboard.shared.endEditing()
+        Task { await onSubmit() }
+    }
+
+    /// Bricht die Bearbeitung ab und gibt den Tastatur-Fokus frei.
+    private func cancelEditing() {
+        focusedInput = nil
+        WorkflowKeyboard.shared.endEditing()
     }
 
     private func actionButton(
@@ -324,6 +421,30 @@ private struct WorkflowSessionRow: View {
     private var isReplyPending: Bool {
         guard let kind = pending?.kind?.lowercased() else { return false }
         return kind == "reply"
+    }
+
+    /// Bei Frage/Antwort den vollstaendigen Kontext anzeigen (sonst nil).
+    private var expandedContext: String? {
+        let kind = pending?.kind?.lowercased()
+        let isContextKind = kind == "reply" || kind == "question"
+            || session.normalizedStatus == "question"
+        guard isContextKind else { return nil }
+
+        if let context = pending?.context?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !context.isEmpty {
+            return context
+        }
+        if let summary = pending?.summary?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !summary.isEmpty {
+            return summary
+        }
+        if let questions = pending?.questions,
+           let question = questions
+            .map(\.question)
+            .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
+            return question
+        }
+        return nil
     }
 
     private var questionOptions: [String] {

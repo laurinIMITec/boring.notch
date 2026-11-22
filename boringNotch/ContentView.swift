@@ -160,7 +160,7 @@ struct ContentView: View {
                                 try? await Task.sleep(for: .milliseconds(100))
                                 guard !Task.isCancelled else { return }
                                 await MainActor.run {
-                                    if self.vm.notchState == .open && !self.isHovering && !self.vm.isBatteryPopoverActive && !SharingStateManager.shared.preventNotchClose {
+                                    if self.vm.notchState == .open && !self.isHovering && !self.vm.isBatteryPopoverActive && !SharingStateManager.shared.preventNotchClose && !WorkflowKeyboard.shared.isEditing {
                                         self.vm.close()
                                     }
                                 }
@@ -168,9 +168,13 @@ struct ContentView: View {
                         }
                     }
                     .onChange(of: vm.notchState) { _, newState in
-                        if newState == .closed && isHovering {
-                            withAnimation {
-                                isHovering = false
+                        if newState == .closed {
+                            // Beim Schliessen der Notch die Textbearbeitung beenden.
+                            WorkflowKeyboard.shared.endEditing()
+                            if isHovering {
+                                withAnimation {
+                                    isHovering = false
+                                }
                             }
                         }
                     }
@@ -181,7 +185,7 @@ struct ContentView: View {
                                 try? await Task.sleep(for: .milliseconds(100))
                                 guard !Task.isCancelled else { return }
                                 await MainActor.run {
-                                    if !self.vm.isBatteryPopoverActive && !self.isHovering && self.vm.notchState == .open && !SharingStateManager.shared.preventNotchClose {
+                                    if !self.vm.isBatteryPopoverActive && !self.isHovering && self.vm.notchState == .open && !SharingStateManager.shared.preventNotchClose && !WorkflowKeyboard.shared.isEditing {
                                         self.vm.close()
                                     }
                                 }
@@ -242,7 +246,7 @@ struct ContentView: View {
                 }
 
                 vm.dropEvent = false
-                if !SharingStateManager.shared.preventNotchClose {
+                if !SharingStateManager.shared.preventNotchClose && !WorkflowKeyboard.shared.isEditing {
                     vm.close()
                 }
             }
@@ -558,7 +562,7 @@ struct ContentView: View {
                         self.isHovering = false
                     }
                     
-                    if self.vm.notchState == .open && !self.vm.isBatteryPopoverActive && !SharingStateManager.shared.preventNotchClose {
+                    if self.vm.notchState == .open && !self.vm.isBatteryPopoverActive && !SharingStateManager.shared.preventNotchClose && !WorkflowKeyboard.shared.isEditing {
                         self.vm.close()
                     }
                 }
@@ -592,6 +596,14 @@ struct ContentView: View {
     }
 
     private func handleUpGesture(translation: CGFloat, phase: NSEvent.Phase) {
+        // Im Workflow-Tab scrollt die Geste die Liste, statt die Notch zu schliessen.
+        guard coordinator.currentView != .workflow else {
+            if phase == .ended {
+                withAnimation(animationSpring) { gestureProgress = .zero }
+            }
+            return
+        }
+
         guard vm.notchState == .open && !vm.isHoveringCalendar else { return }
 
         withAnimation(animationSpring) {

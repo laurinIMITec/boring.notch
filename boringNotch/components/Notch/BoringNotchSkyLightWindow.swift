@@ -109,6 +109,11 @@ class BoringNotchSkyLightWindow: NSPanel {
     
     private var observers: Set<AnyCancellable> = []
     
-    override var canBecomeKey: Bool { false }
+    // Key wird das Fenster nur, solange im Workflow-Tab ein Textfeld
+    // bearbeitet wird (sonst wuerde die Notch den Fokus stehlen).
+    override var canBecomeKey: Bool {
+        guard Thread.isMainThread else { return false }
+        return MainActor.assumeIsolated { WorkflowKeyboard.shared.isEditing }
+    }
     override var canBecomeMain: Bool { false }
 }
